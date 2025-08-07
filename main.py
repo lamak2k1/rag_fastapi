@@ -1,57 +1,99 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from dotenv import load_dotenv
-from llama_index.core import load_index_from_storage, StorageContext
+import logging
+
+# LlamaIndex / Chroma
+from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.core import VectorStoreIndex, StorageContext
 from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
 
+# std-lib
+import chromadb
+import os
 
-# ------------------------------------------------------------------
-load_dotenv()                     # ⬅️  reads your .env for OPENAI_API_KEY
-app = FastAPI(title="RAG‑API")
+# ------------------------------------------------------------------#
+#  App-level setup
+# ------------------------------------------------------------------#
+load_dotenv()                              # reads .env -> GOOGLE_API_KEY, etc.
 
-# ---------- Pydantic models ---------- #
+# Configure logging (optional tweak as you like)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
+app = FastAPI(title="RAG-API")
+
+# ------------------------------------------------------------------#
+#  Pydantic models
+# ------------------------------------------------------------------#
 class ChatRequest(BaseModel):
     query: str
-    session_id: Optional[str] = None
+    session_id: Optional[str] = None  # future-proofing
 
 class ChatResponse(BaseModel):
     answer: str
 
-# ---------- load the index once at startup ---------- #
-from llama_index.vector_stores.chroma import ChromaVectorStore
-import chromadb
-from llama_index.core import VectorStoreIndex, StorageContext
-
+# ------------------------------------------------------------------#
+#  Start-up: load the persisted Chroma collection once
+# ------------------------------------------------------------------#
 @app.on_event("startup")
 async def load_rag():
     global qa_engine
 
-    persist_dir = "index"                     # ← where your files sit
+    persist_dir = "index"  # your Chroma files live here
     client = chromadb.PersistentClient(path=persist_dir)
 
-    # pick the first existing collection; if none, raise an error
     collections = client.list_collections()
     if not collections:
         raise RuntimeError(f"No Chroma collections found in {persist_dir}")
-    collection = collections[0]               # reuse the persisted one
 
-    vector_store   = ChromaVectorStore(chroma_collection=collection)
-    storage_ctx    = StorageContext.from_defaults(vector_store=vector_store)
-    embed_model = GoogleGenAIEmbedding(model_name="gemini-embedding-001",task_type="retrieval_document")
-    index  = VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_ctx, embed_model=embed_model)
+    collection = collections[0]  # reuse existing
+    vector_store = ChromaVectorStore(chroma_collection=collection)
+    storage_ctx = StorageContext.from_defaults(vector_store=vector_store)
 
+    # Use the **same** embedding model/dimensions the collection was built with
+    embed_model = GoogleGenAIEmbedding(
+        model_name="gemini-embedding-001",
+        task_type="retrieval_document",
+    )
+
+    index = VectorStoreIndex.from_vector_store(
+        vector_store,
+        storage_context=storage_ctx,
+        embed_model=embed_model,
+    )
     qa_engine = index.as_query_engine()
-    print("✅ Chroma‑based RAG index loaded")
+    logging.info("✅ Chroma-based RAG index loaded")
 
+# ------------------------------------------------------------------#
+#  Health route for Render & k8s probes
+# ------------------------------------------------------------------#
+@app.get("/")
+async def root():
+    return {"status": "ok"}
 
-# ---------- routes ---------- #
 @app.get("/ping")
 async def ping():
     return {"message": "pong"}
 
+# ------------------------------------------------------------------#
+#  Main chat endpoint — now with graceful error handling
+# ------------------------------------------------------------------#
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    response = qa_engine.query(req.query)
-    return ChatResponse(answer=str(response))
+    try:
+        answer = qa_engine.query(req.query)
+        return ChatResponse(answer=str(answer))
+
+    except Exception as exc:
+        # Logs full traceback to STDERR so Render captures it
+        logging.exception("RAG query failed")
+        # Propagate a safe error to caller (400 = client-side issue)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Query failed: {type(exc).__name__}",
+        )
 
