@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware 
 from pydantic import BaseModel
 from typing import Optional
 from dotenv import load_dotenv
@@ -25,6 +26,14 @@ logging.basicConfig(
 )
 
 app = FastAPI(title="RAG-API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # ← or ["https://my-site.com"]
+    allow_methods=["*"],          # GET, POST, PUT, …
+    allow_headers=["*"],          # Authorization, Content-Type, …
+    allow_credentials=True,       # needed if you’ll send cookies / auth headers
+)
 
 # ------------------------------------------------------------------#
 #  Pydantic models
